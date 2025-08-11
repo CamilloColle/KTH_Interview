@@ -1,0 +1,17 @@
+#!/bin/bash
+#SBATCH --account="lp_lnames_mbs_wp1"
+#SBATCH --job-name="qiime"
+#SBATCH --cluster="wice"
+#SBATCH --partition="batch"
+#SBATCH -N 4
+#SBATCH -n 144
+#SBATCH -t 24:00:00
+#SBATCH --mem-per-cpu=4G
+#SBATCH -o ./snake.out
+
+date
+export PATH=/data/leuven/350/vsc35091/miniconda3/envs/snakemake/bin:$PATH #path to the conda environment with snakemake
+export PATH=/data/leuven/350/vsc35091/miniconda3/envs/qiime/bin:$PATH #path to the conda environment with qiime2
+snakemake --unlock #precautionary step to avoid a locked folder error
+snakemake -s /data/leuven/350/vsc35091/THESIS/Snakefile -c 144 #run snakemake command, make sure the '-c' parameter matches the number of dedicated cores
+date

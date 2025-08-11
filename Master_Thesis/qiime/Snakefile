@@ -1,0 +1,369 @@
+
+# This file can be modified to adjust parameters values or input/output paths but it needs to be run via a slurm job.
+# This can be done via the respective file, in this case 'runsnakemake.slrm'.
+# Note that in order to run this a conda environment is needed which includes the qiime2 package and the snakemake package.
+# After changing these initial variables, the rest can be left untouched.
+
+
+# Initial variables set up
+samples, = glob_wildcards("DATA/000.fastq/{name}.fastq.gz") #fastq samples input
+manifest = "/data/leuven/350/vsc35091/THESIS/DATA/input_files/manifest33V2.tsv" #manifest file
+metadata = "/data/leuven/350/vsc35091/THESIS/DATA/input_files/sample_IDs_fixed.tsv" #metadata file (subset)
+full_metadata = "/data/leuven/350/vsc35091/THESIS/DATA/input_files/full_metadata_subset.tsv" #metadata file (full)
+classifier = "/data/leuven/350/vsc35091/THESIS/DATA/input_files/gtdb_classifier.qza" #classifier file (downloadable from the qiime2 website)
+rarefaction_depth = 4000 # sequencing depth for alpha rarefaction
+diversity_depth = 2000 #sequencing depth for the diversity metrics
+
+# General rule to enforce all outputs are produced
+rule all:
+    input:
+        fastqc_gz=expand(
+            "DATA/000.fastqc/{name}.fastq.gz",
+            name=samples),
+        filepaths=manifest,
+        metadata=metadata,
+        #import="DATA/010_import/import.qzv", #uncomment if you want rule make_manifest to run
+        beta_sig="DATA/040_diversity/042_beta/unweighted-unifrac-body-site-significance.qzv",
+        alpha_rar="DATA/040_diversity/041_alpha/alpha-rarefaction.qzv",
+        table="DATA/020_dada/table.qzv",
+        alpha="DATA/040_diversity/041_alpha/faith-pd-group-significance.qzv",
+        taxa="DATA/050_taxonomy/taxonomy.qzv",
+        barplot="DATA/050_taxonomy/taxa-bar-plots.qzv",
+        
+
+
+# This step needs to be done una tantum - uncomment if needed
+# In case of errors, this can be done externally via the 'make_manifest.sh' file
+# rule make_manifest:
+#     input:
+#         meta=metadata,
+#         dir="DATA/000_fastqc",
+#     output:
+#         tsv="DATA/input_files/manifest.tsv",
+#     shell:
+#         """
+#         for fastq_file in "{input.dir}"/*.fastq.gz; do
+#             if [ -f "$fastq_file" ]; then
+#                 barcode=$(echo "$fastq_file" | awk -F'.' '{print $1}' | awk -F'/' '{print $9}')
+#                 sample_id=$(grep "$barcode" "{input.meta}" | cut -f 1)
+#                 absolute_filepath=$(realpath "$fastq_file")
+#                 echo -e "$sample_id\t$absolute_filepath" >> "{output.tsv}"
+#             fi
+#         done
+#         """
+
+
+# Import data
+rule import_data:
+    input:
+        tsv=manifest,
+    output:
+        qza="DATA/010_import/sequences.qza",
+    shell:
+        """
+        mkdir -p DATA/010_import
+
+        qiime tools import --type 'SampleData[SequencesWithQuality]' \
+            --input-path {input.tsv} \
+            --output-path {output.qza} \
+            --input-format SingleEndFastqManifestPhred33V2
+        """
+
+# Summarize imported data
+rule summarize_input:
+    input:
+       qza="DATA/010_import/sequences.qza",
+    output:
+        qzv="DATA/010_import/import.qzv",
+    shell:
+        """
+        qiime demux summarize \
+            --i-data {input.qza} \
+            --o-visualization {output.qzv}
+        """
+
+
+# Denoise reads
+rule dada2:
+    input:
+        qza="DATA/010_import/sequences.qza",
+    output:
+        rep_seqs="DATA/020_dada/rep-seqs.qza",
+        table="DATA/020_dada/table.qza",
+        stats="DATA/020_dada/stats.qza",
+    params:
+        trim_left="0",
+        trunc_len="0",
+    threads: 36,
+    shell:
+        """
+        mkdir -p DATA/020_dada
+
+        qiime dada2 denoise-ccs \
+            --i-demultiplexed-seqs {input.qza} \
+            --p-front AGRGTTYGATYMTGGCTCAG \
+            --p-adapter RGYTACCTTGTTACGACTT \
+            --p-n-threads {threads} \
+            --o-representative-sequences {output.rep_seqs} \
+            --o-table {output.table} \
+            --o-denoising-stats {output.stats} \
+            --verbose
+        """
+
+
+# Summarize dada output
+rule summarize_dada:
+    input:
+        stats="DATA/020_dada/stats.qza",
+        rep_seqs="DATA/020_dada/rep-seqs.qza",
+        table="DATA/020_dada/table.qza",
+        meta=metadata, ###########################
+    output:
+        stats="DATA/020_dada/stats.qzv",
+        rep_seqs="DATA/020_dada/rep-seqs.qzv",
+        table="DATA/020_dada/table.qzv",
+    shell:
+        """
+        qiime metadata tabulate \
+            --m-input-file {input.stats} \
+            --o-visualization {output.stats}
+
+        qiime feature-table summarize \
+            --i-table {input.table} \
+            --o-visualization {output.table} \
+            --m-sample-metadata-file {input.meta}
+
+        qiime feature-table tabulate-seqs \
+            --i-data {input.rep_seqs} \
+            --o-visualization {output.rep_seqs}
+        """
+
+
+# Build phylogenetic tree for diversity
+rule phylogenetic_tree:
+    input:
+        rep_seqs="DATA/020_dada/rep-seqs.qza",
+    output:
+        aligned_reps="DATA/030_tree/aligned-rep-seqs.qza",
+        masked_alignment="DATA/030_tree/masked-aligned-rep-seqs.qza",
+        unrooted_tree="DATA/030_tree/unrooted-tree.qza",
+        rooted_tree="DATA/030_tree/rooted-tree.qza",
+    threads: 144,
+    shell:
+        """
+        mkdir -p DATA/030_tree
+
+        qiime phylogeny align-to-tree-mafft-fasttree \
+            --i-sequences {input.rep_seqs} \
+            --o-alignment {output.aligned_reps} \
+            --o-masked-alignment {output.masked_alignment} \
+            --o-tree {output.unrooted_tree} \
+            --o-rooted-tree {output.rooted_tree} \
+            --p-n-threads {threads} \
+            --verbose
+        """
+
+# Compute diversity scores
+rule diversity:
+    input:
+        tree="DATA/030_tree/rooted-tree.qza",
+        table="DATA/020_dada/table.qza",
+        meta=metadata,
+    output:
+        faith_pd_vector="DATA/040_diversity/faith_pd_vector.qza",
+        unweighted_unifrac_distance_matrix="DATA/040_diversity/unweighted_unifrac_distance_matrix.qza",
+        bray_curtis_pcoa_results="DATA/040_diversity/bray_curtis_pcoa_results.qza",
+        shannon_vector="DATA/040_diversity/shannon_vector.qza",
+        rarefied_table="DATA/040_diversity/rarefied_table.qza",
+        weighted_unifrac_distance_matrix="DATA/040_diversity/weighted_unifrac_distance_matrix.qza",
+        jaccard_pcoa_results="DATA/040_diversity/jaccard_pcoa_results.qza",
+        weighted_unifrac_pcoa_results="DATA/040_diversity/weighted_unifrac_pcoa_results.qza",
+        observed_features_vector="DATA/040_diversity/observed_features_vector.qza",
+        jaccard_distance_matrix="DATA/040_diversity/jaccard_distance_matrix.qza",
+        evenness_vector="DATA/040_diversity/evenness_vector.qza",
+        bray_curtis_distance_matrix="DATA/040_diversity/bray_curtis_distance_matrix.qza",
+        unweighted_unifrac_pcoa_results="DATA/040_diversity/unweighted_unifrac_pcoa_results.qza",
+        unweighted_unifrac_emperor="DATA/040_diversity/unweighted_unifrac_emperor.qzv",
+        jaccard_emperor="DATA/040_diversity/jaccard_emperor.qzv",
+        bray_curtis_emperor="DATA/040_diversity/bray_curtis_emperor.qzv",
+        weighted_unifrac_emperor="DATA/040_diversity/weighted_unifrac_emperor.qzv",
+    params:
+        depth=diversity_depth, #look at feature table output (interactive sample detail tab) from the dada step, 
+                               #choose a number that retains most samples and drops the ones with too few sequences
+
+    shell:
+        """
+        mkdir -p DATA/040_diversity
+        
+        qiime diversity core-metrics-phylogenetic \
+            --i-phylogeny {input.tree} \
+            --i-table  {input.table}\
+            --p-sampling-depth {params.depth} \
+            --m-metadata-file {input.meta} \
+            --o-faith-pd-vector {output.faith_pd_vector} \
+            --o-unweighted-unifrac-distance-matrix {output.unweighted_unifrac_distance_matrix} \
+            --o-bray-curtis-pcoa-results {output.bray_curtis_pcoa_results} \
+            --o-shannon-vector {output.shannon_vector} \
+            --o-rarefied-table {output.rarefied_table} \
+            --o-weighted-unifrac-distance-matrix {output.weighted_unifrac_distance_matrix} \
+            --o-jaccard-pcoa-results {output.jaccard_pcoa_results} \
+            --o-weighted-unifrac-pcoa-results {output.weighted_unifrac_pcoa_results} \
+            --o-observed-features-vector {output.observed_features_vector} \
+            --o-jaccard-distance-matrix {output.jaccard_distance_matrix} \
+            --o-evenness-vector {output.evenness_vector} \
+            --o-bray-curtis-distance-matrix {output.bray_curtis_distance_matrix} \
+            --o-unweighted-unifrac-pcoa-results {output.unweighted_unifrac_pcoa_results} \
+            --o-unweighted-unifrac-emperor {output.unweighted_unifrac_emperor} \
+            --o-jaccard-emperor {output.jaccard_emperor} \
+            --o-bray-curtis-emperor {output.bray_curtis_emperor} \
+            --o-weighted-unifrac-emperor {output.weighted_unifrac_emperor} \
+            --verbose
+        """
+
+# Alpha diversity
+rule alpha:
+    input:
+        faith_vector="DATA/040_diversity/faith_pd_vector.qza",
+        evenness_vector="DATA/040_diversity/evenness_vector.qza",
+        shannon_vector="DATA/040_diversity/shannon_vector.qza",
+        meta=metadata,
+    output:
+        faith="DATA/040_diversity/041_alpha/faith-pd-group-significance.qzv",
+        evenness="DATA/040_diversity/041_alpha/evenness-group-significance.qzv",
+        shannon="DATA/040_diversity/041_alpha/shannon_vector.qzv",
+    shell:
+        """
+        mkdir -p DATA/040_diversity/041_alpha
+
+        qiime diversity alpha-group-significance \
+            --i-alpha-diversity {input.faith_vector} \
+            --m-metadata-file {input.meta} \
+            --o-visualization {output.faith} \
+            --verbose
+
+        qiime diversity alpha-group-significance \
+            --i-alpha-diversity {input.evenness_vector} \
+            --m-metadata-file {input.meta} \
+            --o-visualization {output.evenness} \
+            --verbose
+
+        qiime diversity alpha-group-significance \
+            --i-alpha-diversity {input.shannon_vector} \
+            --m-metadata-file {input.meta} \
+            --o-visualization {output.shannon} \
+            --verbose
+        """
+
+# Beta diversity
+rule beta:
+    input:
+        unweighted="DATA/040_diversity/unweighted_unifrac_distance_matrix.qza",
+        weighted="DATA/040_diversity/weighted_unifrac_distance_matrix.qza",
+        bc="DATA/040_diversity/bray_curtis_distance_matrix.qza",
+        meta=metadata,
+    output:
+        unweighted="DATA/040_diversity/042_beta/unweighted-unifrac-body-site-significance.qzv",
+        weighted="DATA/040_diversity/042_beta/weighted-unifrac-body-site-significance.qzv",
+        bc="DATA/040_diversity/042_beta/bray_curtis.qzv",
+    params:
+        column="location",
+    shell:
+        """
+        mkdir -p DATA/040_diversity/042_beta
+
+        qiime diversity beta-group-significance \
+            --i-distance-matrix {input.unweighted} \
+            --m-metadata-file {input.meta} \
+            --m-metadata-column {params.column} \
+            --o-visualization {output.unweighted} \
+            --p-no-pairwise \
+            --verbose
+
+        qiime diversity beta-group-significance \
+            --i-distance-matrix {input.weighted} \
+            --m-metadata-file {input.meta} \
+            --m-metadata-column {params.column} \
+            --o-visualization {output.weighted} \
+            --p-no-pairwise \
+            --verbose
+
+        qiime diversity beta-group-significance \
+            --i-distance-matrix {input.bc} \
+            --m-metadata-file {input.meta} \
+            --m-metadata-column {params.column} \
+            --o-visualization {output.bc} \
+            --p-no-pairwise \
+            --verbose
+        """
+
+# Alpha rarefaction
+rule alpha_rarefaction:
+    input:
+        table="DATA/020_dada/table.qza",
+        tree="DATA/030_tree/rooted-tree.qza",
+        meta=metadata,
+    output:
+        qzv="DATA/040_diversity/041_alpha/alpha-rarefaction.qzv",
+    params:
+        depth=rarefaction_depth, #look at the "frequency per sample" in the feature table, 
+                                 #choose a number around the median and increase if the lines in the rarefaction plot don't level out
+    shell:
+        """
+        qiime diversity alpha-rarefaction \
+            --i-table {input.table} \
+            --i-phylogeny {input.tree} \
+            --p-max-depth {params.depth} \
+            --m-metadata-file {input.meta} \
+            --o-visualization {output.qzv} \
+            --verbose
+        """
+
+# Taxonomic classification
+rule taxonomy:
+    input:
+        classifier=classifier,
+        rep_seqs="DATA/020_dada/rep-seqs.qza",
+    output:
+        qza="DATA/050_taxonomy/taxonomy.qza",
+    shell:
+        """
+        mkdir -p DATA/050_taxonomy
+
+        qiime feature-classifier classify-sklearn \
+            --i-classifier {input.classifier} \
+            --i-reads {input.rep_seqs} \
+            --o-classification {output.qza} \
+            --verbose
+        """
+
+# Summarize taxonomy
+rule summarize_taxonomy:
+    input:
+        taxa="DATA/050_taxonomy/taxonomy.qza",
+        table="DATA/020_dada/table.qza",
+        meta=metadata,
+    output:
+        taxa="DATA/050_taxonomy/taxonomy.qzv",
+        barplot="DATA/050_taxonomy/taxa-bar-plots.qzv",
+    shell:
+        """
+        qiime metadata tabulate \
+            --m-input-file {input.taxa} \
+            --o-visualization {output.taxa}
+
+        qiime taxa barplot \
+            --i-table {input.table} \
+            --i-taxonomy {input.taxa} \
+            --m-metadata-file {input.meta} \
+            --o-visualization {output.barplot} \
+            --verbose
+        """
+
+# Generate report
+onsuccess:
+    shell(
+        r"""
+        snakemake -s /data/leuven/350/vsc35091/THESIS/Snakefile --unlock
+        snakemake -s /data/leuven/350/vsc35091/THESIS/Snakefile -c 8 --report report.html
+        """)
+
